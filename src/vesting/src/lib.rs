@@ -1,6 +1,14 @@
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol};
 
 const CLIFF_REACHED: Symbol = symbol_short!("CliffReached");
+const SCHEDULE_REVOKED: Symbol = symbol_short!("Revoked");
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VestingStatus {
+    Active,
+    Revoked,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -11,6 +19,8 @@ pub struct VestingSchedule {
     pub end_time: u64,
     pub total_amount: i128,
     pub claimed_amount: i128,
+    pub revocable: bool,
+    pub status: VestingStatus,
 }
 
 #[contract]
@@ -28,6 +38,7 @@ impl VestingContract {
         cliff_time: u64,
         end_time: u64,
         total_amount: i128,
+        revocable: bool,
     ) -> VestingSchedule {
         Self::validate_schedule(start_time, cliff_time, end_time);
 
@@ -38,6 +49,8 @@ impl VestingContract {
             end_time,
             total_amount,
             claimed_amount: 0,
+            revocable,
+            status: VestingStatus::Active,
         }
     }
 
@@ -98,6 +111,42 @@ impl VestingContract {
         claimable
     }
 
+    /// Revoke an active, revocable vesting schedule.
+    ///
+    /// The admin must authenticate. Already-vested tokens up to
+    /// `current_timestamp` are preserved for the beneficiary (pro-rata refund),
+    /// while the remaining unvested tokens are returned to the admin/treasury.
+    /// The schedule is marked `Revoked` so no further vesting accrues.
+    ///
+    /// Returns `(beneficiary_amount, admin_amount)`.
+    pub fn revoke_schedule(
+        env: Env,
+        admin: Address,
+        schedule: VestingSchedule,
+        current_timestamp: u64,
+    ) -> (i128, i128) {
+        admin.require_auth();
+
+        assert!(schedule.revocable, "schedule is not revocable");
+        assert!(
+            schedule.status == VestingStatus::Active,
+            "schedule is not active"
+        );
+
+        Self::validate_schedule(schedule.start_time, schedule.cliff_time, schedule.end_time);
+
+        let vested = Self::calculate_vested_amount(env.clone(), schedule.clone(), current_timestamp);
+        let beneficiary_amount = vested - schedule.claimed_amount;
+        let admin_amount = schedule.total_amount - vested;
+
+        env.events().publish(
+            (SCHEDULE_REVOKED, schedule.beneficiary.clone()),
+            (beneficiary_amount, admin_amount),
+        );
+
+        (beneficiary_amount, admin_amount)
+    }
+
     fn validate_schedule(start_time: u64, cliff_time: u64, end_time: u64) {
         assert!(start_time <= cliff_time, "start_time must be <= cliff_time");
         assert!(cliff_time <= end_time, "cliff_time must be <= end_time");
@@ -118,6 +167,8 @@ mod tests {
             end_time: end,
             total_amount: 1_000,
             claimed_amount: 0,
+            revocable: true,
+            status: VestingStatus::Active,
         }
     }
 
@@ -167,5 +218,62 @@ mod tests {
         let env = Env::default();
         let s = schedule(&env, 0, 250, 200);
         VestingContract::calculate_vested_amount(env.clone(), s, 250);
+    }
+
+    #[test]
+    fn test_revoke_partial_vesting_splits_pro_rata() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let s = schedule(&env, 0, 100, 200);
+
+        // Halfway through the linear vesting window: 500 vested, 500 unvested.
+        let (beneficiary_amount, admin_amount) =
+            VestingContract::revoke_schedule(env.clone(), admin, s, 150);
+
+        assert_eq!(beneficiary_amount, 500);
+        assert_eq!(admin_amount, 500);
+    }
+
+    #[test]
+    fn test_revoke_before_cliff_returns_all_to_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let s = schedule(&env, 0, 100, 200);
+
+        let (beneficiary_amount, admin_amount) =
+            VestingContract::revoke_schedule(env.clone(), admin, s, 50);
+
+        assert_eq!(beneficiary_amount, 0);
+        assert_eq!(admin_amount, 1_000);
+    }
+
+    #[test]
+    fn test_revoke_accounts_for_already_claimed_tokens() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let mut s = schedule(&env, 0, 100, 200);
+        s.claimed_amount = 200;
+
+        let (beneficiary_amount, admin_amount) =
+            VestingContract::revoke_schedule(env.clone(), admin, s, 150);
+
+        // 500 vested total, 200 already claimed -> 300 still owed to beneficiary.
+        assert_eq!(beneficiary_amount, 300);
+        assert_eq!(admin_amount, 500);
+    }
+
+    #[test]
+    #[should_panic(expected = "schedule is not revocable")]
+    fn test_revoke_non_revocable_schedule_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let mut s = schedule(&env, 0, 100, 200);
+        s.revocable = false;
+
+        VestingContract::revoke_schedule(env.clone(), admin, s, 150);
     }
 }

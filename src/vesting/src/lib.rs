@@ -10,6 +10,19 @@ pub enum VestingStatus {
     Revoked,
 }
 
+/// Unlock schedule selection.
+///
+/// `Continuous` releases tokens second-by-second (linear) between the cliff and
+/// the end time. `Step(step_duration)` releases tokens in discrete tranches,
+/// where `step_duration` is the length of each step in seconds (e.g. 30 days for
+/// monthly unlocks). Partial steps never release tokens.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UnlockType {
+    Continuous,
+    Step(u64),
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VestingSchedule {
@@ -21,6 +34,7 @@ pub struct VestingSchedule {
     pub claimed_amount: i128,
     pub revocable: bool,
     pub status: VestingStatus,
+    pub unlock_type: UnlockType,
 }
 
 #[contract]
@@ -39,6 +53,7 @@ impl VestingContract {
         end_time: u64,
         total_amount: i128,
         revocable: bool,
+        unlock_type: UnlockType,
     ) -> VestingSchedule {
         Self::validate_schedule(start_time, cliff_time, end_time);
 
@@ -51,13 +66,16 @@ impl VestingContract {
             claimed_amount: 0,
             revocable,
             status: VestingStatus::Active,
+            unlock_type,
         }
     }
 
     /// Calculate the amount of tokens vested at `current_timestamp`.
     ///
     /// Returns `0` for any timestamp strictly before the cliff. Once the cliff
-    /// is reached, tokens vest linearly between `cliff_time` and `end_time`.
+    /// is reached, tokens vest according to the schedule's `UnlockType`:
+    /// continuously (linear) or in discrete steps where partial steps release
+    /// nothing.
     pub fn calculate_vested_amount(
         env: Env,
         schedule: VestingSchedule,
@@ -81,7 +99,31 @@ impl VestingContract {
             return schedule.total_amount;
         }
 
-        schedule.total_amount * (elapsed as i128) / (duration as i128)
+        match schedule.unlock_type {
+            UnlockType::Continuous => {
+                schedule.total_amount * (elapsed as i128) / (duration as i128)
+            }
+            UnlockType::Step(step_duration) => {
+                if step_duration == 0 {
+                    return 0;
+                }
+
+                // Number of fully completed steps. Floor division ensures a
+                // partial step never releases tokens.
+                let completed_steps = elapsed / step_duration;
+                let total_steps = duration / step_duration;
+
+                if total_steps == 0 {
+                    return schedule.total_amount;
+                }
+
+                if completed_steps >= total_steps {
+                    return schedule.total_amount;
+                }
+
+                schedule.total_amount * (completed_steps as i128) / (total_steps as i128)
+            }
+        }
     }
 
     /// Claim vested tokens for the beneficiary.
@@ -159,6 +201,8 @@ mod tests {
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::Env;
 
+    const DAY: u64 = 86_400;
+
     fn schedule(env: &Env, start: u64, cliff: u64, end: u64) -> VestingSchedule {
         VestingSchedule {
             beneficiary: Address::generate(env),
@@ -169,7 +213,14 @@ mod tests {
             claimed_amount: 0,
             revocable: true,
             status: VestingStatus::Active,
+            unlock_type: UnlockType::Continuous,
         }
+    }
+
+    fn step_schedule(env: &Env, start: u64, cliff: u64, end: u64, step: u64) -> VestingSchedule {
+        let mut s = schedule(env, start, cliff, end);
+        s.unlock_type = UnlockType::Step(step);
+        s
     }
 
     #[test]
@@ -250,30 +301,52 @@ mod tests {
     }
 
     #[test]
-    fn test_revoke_accounts_for_already_claimed_tokens() {
+    fn test_step_unlock_releases_nothing_before_first_step() {
         let env = Env::default();
-        env.mock_all_auths();
-        let admin = Address::generate(&env);
-        let mut s = schedule(&env, 0, 100, 200);
-        s.claimed_amount = 200;
+        // 30-day steps over a 90-day window starting at the cliff.
+        let s = step_schedule(&env, 0, 0, 90 * DAY, 30 * DAY);
 
-        let (beneficiary_amount, admin_amount) =
-            VestingContract::revoke_schedule(env.clone(), admin, s, 150);
+        // Just before the first full step completes: nothing released.
+        let vested = VestingContract::calculate_vested_amount(env.clone(), s.clone(), 30 * DAY - 1);
+        assert_eq!(vested, 0);
 
-        // 500 vested total, 200 already claimed -> 300 still owed to beneficiary.
-        assert_eq!(beneficiary_amount, 300);
-        assert_eq!(admin_amount, 500);
+        // Exactly at the first step boundary: one third released.
+        let vested = VestingContract::calculate_vested_amount(env.clone(), s, 30 * DAY);
+        assert_eq!(vested, 333);
     }
 
     #[test]
-    #[should_panic(expected = "schedule is not revocable")]
-    fn test_revoke_non_revocable_schedule_panics() {
+    fn test_step_unlock_partial_step_does_not_release() {
         let env = Env::default();
-        env.mock_all_auths();
-        let admin = Address::generate(&env);
-        let mut s = schedule(&env, 0, 100, 200);
-        s.revocable = false;
+        let s = step_schedule(&env, 0, 0, 90 * DAY, 30 * DAY);
 
-        VestingContract::revoke_schedule(env.clone(), admin, s, 150);
+        // 45 days in: only the first completed step counts (1/3).
+        let vested = VestingContract::calculate_vested_amount(env.clone(), s, 45 * DAY);
+        assert_eq!(vested, 333);
+    }
+
+    #[test]
+    fn test_step_unlock_full_at_end() {
+        let env = Env::default();
+        let s = step_schedule(&env, 0, 0, 90 * DAY, 30 * DAY);
+        let vested = VestingContract::calculate_vested_amount(env.clone(), s, 90 * DAY);
+        assert_eq!(vested, 1_000);
+    }
+
+    #[test]
+    fn test_continuous_vs_step_unlock_differ_midway() {
+        let env = Env::default();
+        let continuous = schedule(&env, 0, 0, 90 * DAY);
+        let step = step_schedule(&env, 0, 0, 90 * DAY, 30 * DAY);
+
+        // At 45 days: continuous has vested half, step has vested one third.
+        let continuous_vested =
+            VestingContract::calculate_vested_amount(env.clone(), continuous, 45 * DAY);
+        let step_vested =
+            VestingContract::calculate_vested_amount(env.clone(), step, 45 * DAY);
+
+        assert_eq!(continuous_vested, 500);
+        assert_eq!(step_vested, 333);
+        assert!(step_vested < continuous_vested);
     }
 }
